@@ -1,0 +1,575 @@
+//@version=6
+// =============================================================================
+//  SMC Combined v2 — Confirmed S&D Signals + Prior-Day & Session Levels
+// -----------------------------------------------------------------------------
+//  Signals are a pullback -> reclaim trigger gated by a STACK of confirmations
+//  you can toggle on/off (no-repaint, higher-timeframe agreement, momentum turn,
+//  volume, and S&D / prior-day location). A signal fires when AT LEAST your chosen
+//  number of the enabled confirmations pass — the dashboard shows the live count.
+//  Also draws: quality-scored supply & demand zones (best zones kept; no letters),
+//  chart-timeframe fair value gaps, prior-day high/low, previous-session high/low,
+//  and a customizable bias/confirmation dashboard.
+//
+//  AUTO-ADAPT TO TIMEFRAME (default ON): swing length, max zones per side, FVG
+//  minimum size, and minimum zone grade to draw are chosen automatically from the
+//  chart timeframe — looser/more zones on 1m-5m for scalping, stricter/fewer on
+//  higher timeframes. Turn it off to drive those four from the manual sliders.
+// =============================================================================
+indicator("SMC Combined - Confirmed Signals, Graded S&D Zones & FVG", overlay=true, max_boxes_count=120, max_lines_count=500, max_labels_count=20, max_bars_back=2000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+gM = "Bias & Signals"
+sens = input.string("Normal", "Signal frequency", options=["Few", "Normal", "Many"], group=gM, tooltip="Sets the EMA lengths used for trend bias and the pullback. Few = slower/strict, Many = faster/looser.")
+
+gS = "Signal Confirmations"
+confirmClose = input.bool(true,  "Only signal on closed bars (no repaint)", group=gS, tooltip="Strongly recommended. When off, arrows can appear mid-bar and then disappear if the bar reverses before closing.")
+useHTF = input.bool(true,  "Require higher-timeframe agreement", group=gS, tooltip="Longs only when the bigger (4x) timeframe is also up; shorts only when it is down.")
+htfHard= input.bool(true,  "    ^ make HTF agreement MANDATORY (block counter-trend)", group=gS, tooltip="When ON, a long can ONLY fire if the bigger timeframe is up, and a short ONLY if it is down — regardless of how many other confirmations pass. This is the main filter that stops 'sold right before the rally' signals against the bigger trend. Turn OFF to let HTF be just one vote among the confirmations.")
+useMom = input.bool(true,  "Require momentum turn (RSI)", group=gS, tooltip="Longs need RSI above 50 and ticking up; shorts need RSI below 50 and ticking down.")
+useVol = input.bool(true,  "Require above-average volume", group=gS, tooltip="Volume must beat its 20-bar average — filters dead, low-conviction bars.")
+useLoc = input.bool(true,  "Require S&D / prior-day confluence", group=gS, tooltip="Longs only inside a demand zone or near the prior-day low; shorts only inside a supply zone or near the prior-day high.")
+reqConf = input.int(2, "Confirmations required (of enabled)", minval=1, maxval=4, group=gS, tooltip="A signal fires when AT LEAST this many of the enabled confirmations pass on the trigger bar — you do NOT need all 4. 2 = more signals (default), 3 = strong, 4 = only-perfect. The dashboard always shows the full count so you keep the quality picture.")
+locTol = input.float(0.5, "Level proximity (x ATR)", minval=0.1, step=0.1, group=gS, tooltip="How close to the prior-day high/low counts as 'at the level', measured in ATRs.")
+pbLook = input.int(3, "Pullback lookback (bars)", minval=1, maxval=10, group=gS, tooltip="Price must have tagged the fast EMA within this many bars before the reclaim.")
+cooldown = input.int(3, "Min bars between signals", minval=0, maxval=50, group=gS, tooltip="Prevents clustered, repeated signals after one fires.")
+
+gD = "Prior Day Levels"
+showPD   = input.bool  (true,  "Show prev day high / low (PDH / PDL)", group=gD)
+cPdHi    = input.color (color.new(#ef5350, 0), "High color", inline="c4", group=gD)
+cPdLo    = input.color (color.new(#26a69a, 0), "Low color",  inline="c4", group=gD)
+wPd      = input.int   (2, "Line width", minval=1, maxval=5, group=gD)
+styPdS   = input.string("Solid", "Line style", options=["Solid","Dashed","Dotted"], group=gD)
+lblPd    = input.bool  (true,  "Show price labels", group=gD)
+lblSizeS = input.string("Normal", "Label size", options=["Tiny","Small","Normal","Large"], group=gD)
+lblTxtCol= input.color (color.white, "Label text color", group=gD, tooltip="Text color inside ALL level price tags (prior-day + previous-session). The tag background uses the level color, so keep this contrasting.")
+lblFont  = input.string("Default", "Label font", options=["Default","Monospace"], group=gD, tooltip="Font family for all level labels. Monospace gives an even, terminal-style look. (Label SIZE = 'Label size' above; COLOR = 'Label text color' above.)")
+lblOffset= input.int   (3, "Label offset (bars to the right)", minval=0, maxval=500, group=gD, tooltip="Pushes the price tags to the right of the last candle so they don't sit on top of the line / price action. TradingView caps drawings at 500 bars into the future, so 500 is the practical max.")
+
+gSess = "Previous Session High / Low"
+showSess  = input.bool(true, "Show previous session high / low", group=gSess, tooltip="Plots the high and low of the PREVIOUS completed session (set by the window + timezone below), extended into the current session.")
+sessSpec  = input.session("0930-1600", "Session window", group=gSess, tooltip="The session whose previous high/low to track. Default = US regular cash hours (09:30-16:00). For the overnight / Globex range use e.g. 1800-0930.")
+sessTz    = input.string("America/New_York", "Session timezone", options=["America/New_York","America/Chicago","America/Los_Angeles","Europe/London","UTC"], group=gSess)
+cSessHi   = input.color(color.new(#ff9800, 0), "Session high color", inline="sc", group=gSess)
+cSessLo   = input.color(color.new(#ab47bc, 0), "Session low color",  inline="sc", group=gSess)
+wSess     = input.int(1, "Line width", minval=1, maxval=5, group=gSess)
+stySessS  = input.string("Dotted", "Line style", options=["Solid","Dashed","Dotted"], group=gSess)
+
+gTF = "Auto-Adapt to Timeframe"
+autoTF = input.bool(true, "Auto-adapt zone/FVG settings to chart timeframe", group=gTF, tooltip="When ON, Swing length, Max zones, FVG min size and Min grade to draw are chosen automatically from your chart's timeframe (looser/more zones on 1m-5m for scalping; stricter/fewer on higher timeframes). The matching manual sliders below are IGNORED while this is ON — turn it OFF to use them. ATR-based settings (displacement, width, level proximity) already scale with volatility and are unaffected.")
+
+gz = "Supply & Demand Zones"
+showZones = input.bool  (true, "Show S&D zones", group=gz)
+swingLen  = input.int   (10, "Swing length (pivot legs)", minval=2, maxval=50, group=gz, tooltip="Bars required on each side of a swing high/low. Higher = fewer, more significant zones. Zones confirm this many bars after the pivot forms (no repaint). (Ignored while Auto-Adapt to Timeframe is ON.)")
+maxZones  = input.int   (4, "Max zones per side", minval=1, maxval=15, group=gz, tooltip="Keeps the chart clean — only the most recent N supply and N demand zones stay drawn. (Ignored while Auto-Adapt to Timeframe is ON.)")
+zoneSrc   = input.string("Wick to body", "Zone height", options=["Wick to body","Full candle"], group=gz, tooltip="Wick to body = tighter institutional zone (the rejection candle's wick + body). Full candle = the entire high-low range of the swing candle.")
+cSupply   = input.color (#ef5350, "Supply color", inline="zc", group=gz, tooltip="Hue only — fill opacity is set by 'Zone transparency' below.")
+cDemand   = input.color (#26a69a, "Demand color", inline="zc", group=gz)
+zTransp   = input.int   (82, "Zone transparency", minval=0, maxval=100, group=gz)
+zBorder   = input.bool  (true, "Zone border", inline="zb", group=gz)
+zBordW    = input.int   (1, "width", minval=1, maxval=4, inline="zb", group=gz)
+removeMit = input.bool  (true, "Remove zone when broken (invalidated)", group=gz, tooltip="Delete a supply zone once price closes above it, or a demand zone once price closes below it.")
+
+gZQ = "Zone Quality (grade & filter)"
+useDisp   = input.bool(true,  "Grade: displacement (impulse left the zone)", group=gZQ, tooltip="+1 grade if the pivot launched a move >= the size below — the footprint of an institutional origin vs. random chop.")
+dispMult  = input.float(2.0,  "      displacement >= (x ATR)", minval=0.5, step=0.1, group=gZQ)
+useSweep  = input.bool(true,  "Grade: liquidity sweep (stop-run + reclaim)", group=gZQ, tooltip="+1 grade if the pivot ran past the prior swing (grabbed stops) then closed back inside — the manipulation that validates a reaction zone.")
+useWidth  = input.bool(true,  "Grade: tight width (precise level)", group=gZQ, tooltip="+1 grade if the zone is no wider than the size below — a precise level, not a vague area.")
+goodWidth = input.float(0.5,  "      tight if width <= (x ATR)", minval=0.1, step=0.1, group=gZQ)
+maxWidth  = input.float(1.5,  "Cap zone height at (x ATR)", minval=0.3, step=0.1, group=gZQ, tooltip="Trims giant climax-candle boxes so a zone stays a precise level instead of a huge band.")
+minDrawGr = input.int(0,      "Min grade to DRAW (0 = show all, graded)", minval=0, maxval=3, group=gZQ, tooltip="0 keeps every level on the chart, graded, so low timeframes still show reaction levels. Raise to 2-3 to declutter to only strong zones. (Ignored while Auto-Adapt to Timeframe is ON.)")
+sigMinGr  = input.int(0,      "Min grade for SIGNALS", minval=0, maxval=3, group=gZQ, tooltip="A trade's location confluence only counts zones at least this grade. 0 (default) = any drawn zone qualifies (more signals). Raise to 1-2 to require stronger zones at the entry. Drawing is separate, so weaker levels stay visible without authorizing trades.")
+dimTapped = input.bool(true,  "Dim zones once tapped (freshness)", group=gZQ, tooltip="Fresh, untested zones react hardest; tapped zones are faded.")
+
+gF = "Fair Value Gaps (FVG)"
+showFVG    = input.bool(true,  "Show fair value gaps", group=gF)
+fvgMinMult = input.float(0.25, "Min gap size (x ATR)", minval=0.0, step=0.05, group=gF, tooltip="Quality filter — only draw imbalances at least this tall (in ATRs). Raise it to keep just the strong, displacement-driven gaps; 0 shows every gap. (Ignored while Auto-Adapt to Timeframe is ON.)")
+fvgFill    = input.bool(true,  "Remove gap once filled", group=gF, tooltip="Delete an FVG when price trades back to its far edge and fills the imbalance.")
+maxFvg     = input.int(6,      "Max gaps per side", minval=1, maxval=20, group=gF, tooltip="Keeps the chart clean — only the most recent N bullish and N bearish gaps stay drawn.")
+cFvgBull   = input.color(color.new(#26a69a, 80), "Bullish gap", inline="f1", group=gF, tooltip="Includes transparency — adjust the opacity slider in the color picker too.")
+cFvgBear   = input.color(color.new(#ef5350, 80), "Bearish gap", inline="f1", group=gF)
+fvgBorder  = input.bool(false, "Gap border", inline="f2", group=gF)
+fvgBordCol = input.color(color.new(#787b86, 40), "color", inline="f2", group=gF)
+
+gDB = "Dashboard — Style"
+showDash  = input.bool(true, "Show dashboard", group=gDB)
+dashTitle = input.string("SMC DASHBOARD", "Title text", group=gDB, tooltip="Shown in the colored header row. Set it to whatever you like.")
+pos       = input.string("Top Right", "Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=gDB)
+dashTxtSz = input.string("Normal", "Text size", options=["Tiny","Small","Normal","Large"], group=gDB)
+dashBg    = input.color(#131722, "Panel background", inline="d1", group=gDB)
+dashTxt   = input.color(#d1d4dc, "Text", inline="d1", group=gDB)
+dashHdrBg = input.color(#2962ff, "Header bg", inline="d2", group=gDB)
+dashHdrTx = input.color(color.white, "Header text", inline="d2", group=gDB)
+cBull     = input.color(#26a69a, "Bullish", inline="d3", group=gDB, tooltip="Accent used for up bias / longs across the whole indicator (signals, dashboard).")
+cBear     = input.color(#ef5350, "Bearish", inline="d3", group=gDB)
+cNeut     = input.color(#787b86, "Neutral", inline="d3", group=gDB)
+dashFrame    = input.bool(true, "Frame", inline="d4", group=gDB)
+dashFrameCol = input.color(#2a2e39, "color", inline="d4", group=gDB)
+
+gDR = "Dashboard — Rows (show / hide)"
+rowVerdict = input.bool(true,  "Verdict",        inline="r1", group=gDR)
+rowThisTF  = input.bool(true,  "This TF bias",   inline="r1", group=gDR)
+rowHTF     = input.bool(true,  "Bigger TF bias", inline="r2", group=gDR)
+rowConf    = input.bool(true,  "Confirmations",  inline="r2", group=gDR)
+rowRSI     = input.bool(true,  "RSI",            inline="r3", group=gDR)
+rowVol     = input.bool(true,  "Volume",         inline="r3", group=gDR)
+
+// Auto-tuned from frequency
+fastLen = sens == "Few" ? 30 : sens == "Normal" ? 21 : 13
+slowLen = sens == "Few" ? 100 : sens == "Normal" ? 50 : 34
+
+// Auto-adapt to timeframe: pick swing length, max zones, FVG min size and min draw
+// grade from the chart timeframe when ON; otherwise use the manual sliders. These
+// derive only from timeframe.in_seconds() (a simple int, constant per run) + simple
+// inputs, so they stay SIMPLE — ta.pivothigh/ta.pivotlow accept swingLenEff and
+// pivots still confirm swingLenEff bars later (no repaint).
+tfMin         = timeframe.in_seconds() / 60.0
+swingLenEff   = autoTF ? (tfMin <= 1 ? 8 : tfMin <= 5 ? 10 : tfMin <= 15 ? 10 : tfMin <= 60 ? 12 : 14) : swingLen
+maxZonesEff   = autoTF ? (tfMin <= 1 ? 6 : tfMin <= 5 ? 5  : tfMin <= 15 ? 4  : tfMin <= 60 ? 4  : 3 ) : maxZones
+fvgMinMultEff = autoTF ? (tfMin <= 1 ? 0.20 : tfMin <= 5 ? 0.25 : tfMin <= 15 ? 0.30 : tfMin <= 60 ? 0.35 : 0.40) : fvgMinMult
+minDrawGrEff  = autoTF ? (tfMin <= 1 ? 0 : tfMin <= 5 ? 0 : tfMin <= 15 ? 1 : tfMin <= 60 ? 1 : 2) : minDrawGr
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+f_lineStyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+f_lblSize(string s)   => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
+f_font(string s)      => s == "Monospace" ? font.family_monospace : font.family_default
+
+// =============================================================================
+// CORE READ (any timeframe)
+// =============================================================================
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+rsi     = ta.rsi(close, 14)
+atr     = ta.atr(14)
+volOK   = volume > ta.sma(volume, 20)
+hiLeg   = ta.highest(high, swingLenEff)   // departure-leg extremes — hoisted so ta.* runs every bar
+loLeg   = ta.lowest(low,  swingLenEff)
+
+biasUp  = emaFast > emaSlow and close > emaSlow
+biasDn  = emaFast < emaSlow and close < emaSlow
+curBias = biasUp ? 1 : biasDn ? -1 : 0
+
+htf = timeframe.from_seconds(timeframe.in_seconds() * 4)
+htfBias = request.security(syminfo.tickerid, htf, ta.ema(close,21) > ta.ema(close,50) ? 1 : ta.ema(close,21) < ta.ema(close,50) ? -1 : 0, lookahead=barmerge.lookahead_off)
+
+// =============================================================================
+// PRIOR DAY HIGH / LOW + PREVIOUS SESSION HIGH / LOW  (non-repainting)
+// =============================================================================
+[pdH, pdL] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+// Previous SESSION high/low: accumulate the live session's range, then FREEZE it
+// as "previous" the moment that session ends. Drawn values never repaint.
+var float curSessHi = na
+var float curSessLo = na
+var float pSessHi = na
+var float pSessLo = na
+sessNow = not na(time(timeframe.period, sessSpec, sessTz))
+if sessNow and (not sessNow[1] or na(curSessHi))   // start a fresh session range (also seeds the very first session)
+    curSessHi := high
+    curSessLo := low
+else if sessNow
+    curSessHi := math.max(curSessHi, high)
+    curSessLo := math.min(curSessLo, low)
+if not sessNow and sessNow[1]
+    pSessHi := curSessHi
+    pSessLo := curSessLo
+
+// =============================================================================
+// SUPPLY & DEMAND ZONES  (built first so signals can use them for confluence)
+// =============================================================================
+// Zone state: each box has parallel grade / touch-count / inside-flag arrays.
+// They MUST move in lockstep with the box array, so all mutation goes through
+// the helpers below (mutating arrays inside a function is legal; only
+// REASSIGNING a global would be the CE10088 error).
+var array<box>  supBoxes = array.new<box>()
+var array<int>  supGrade = array.new<int>()
+var array<int>  supTouch = array.new<int>()
+var array<bool> supInside= array.new<bool>()
+var array<box>  demBoxes = array.new<box>()
+var array<int>  demGrade = array.new<int>()
+var array<int>  demTouch = array.new<int>()
+var array<bool> demInside= array.new<bool>()
+var float priorPH = na   // prior confirmed pivot high / low — for sweep detection
+var float priorPL = na
+
+f_addSup(box b, int g, bool inside0) =>
+    array.push(supBoxes, b)
+    array.push(supGrade, g)
+    array.push(supTouch, 0)
+    array.push(supInside, inside0)
+f_addDem(box b, int g, bool inside0) =>
+    array.push(demBoxes, b)
+    array.push(demGrade, g)
+    array.push(demTouch, 0)
+    array.push(demInside, inside0)
+f_delSup(int i) =>
+    box.delete(array.get(supBoxes, i))
+    array.remove(supBoxes, i)
+    array.remove(supGrade, i)
+    array.remove(supTouch, i)
+    array.remove(supInside, i)
+f_delDem(int i) =>
+    box.delete(array.get(demBoxes, i))
+    array.remove(demBoxes, i)
+    array.remove(demGrade, i)
+    array.remove(demTouch, i)
+    array.remove(demInside, i)
+// Index of the weakest zone (lowest grade; ties -> oldest) to evict on overflow.
+f_weakSup() =>
+    int wi = 0
+    for i = 1 to array.size(supBoxes) - 1
+        if array.get(supGrade, i) < array.get(supGrade, wi)
+            wi := i
+    wi
+f_weakDem() =>
+    int wi = 0
+    for i = 1 to array.size(demBoxes) - 1
+        if array.get(demGrade, i) < array.get(demGrade, wi)
+            wi := i
+    wi
+
+// True if the pullback window [lo, hi] overlapped a demand/supply zone whose
+// grade is at least minGrade. (Drawing keeps all zones; signals can demand a
+// minimum grade — so weak levels stay visible without authorizing trades.)
+f_demandTouched(float lo, float hi, int minGrade) =>
+    bool hit = false
+    if array.size(demBoxes) > 0
+        for i = 0 to array.size(demBoxes) - 1
+            if array.get(demGrade, i) >= minGrade and lo <= box.get_top(array.get(demBoxes, i)) and hi >= box.get_bottom(array.get(demBoxes, i))
+                hit := true
+    hit
+f_supplyTouched(float lo, float hi, int minGrade) =>
+    bool hit = false
+    if array.size(supBoxes) > 0
+        for i = 0 to array.size(supBoxes) - 1
+            if array.get(supGrade, i) >= minGrade and lo <= box.get_top(array.get(supBoxes, i)) and hi >= box.get_bottom(array.get(supBoxes, i))
+                hit := true
+    hit
+
+ph = ta.pivothigh(swingLenEff, swingLenEff)
+pl = ta.pivotlow (swingLenEff, swingLenEff)
+useWickBody = zoneSrc == "Wick to body"
+
+// SUPPLY zone at a confirmed swing high — GRADED (displacement + sweep + tight width)
+if showZones and barstate.isconfirmed and not na(ph)
+    a    = atr[swingLenEff]
+    sTop = high[swingLenEff]
+    sBot = useWickBody ? math.min(open[swingLenEff], close[swingLenEff]) : low[swingLenEff]
+    if sTop - sBot > maxWidth * a
+        sBot := sTop - maxWidth * a                                  // cap height -> precise level
+    legDn = sTop - loLeg                                             // downward impulse off the pivot
+    disp  = useDisp  and legDn >= dispMult * a
+    swept = useSweep and not na(priorPH) and high[swingLenEff] > priorPH + 0.1 * a and close[swingLenEff] < priorPH
+    zw    = sTop - sBot
+    tight = useWidth and zw <= goodWidth * a and zw >= 0.05 * a
+    g = (disp ? 1 : 0) + (swept ? 1 : 0) + (tight ? 1 : 0)
+    if g >= minDrawGrEff
+        tr0 = math.max(0, math.min(95, zTransp - g * 7))
+        bx = box.new(bar_index - swingLenEff, sTop, bar_index, sBot, xloc=xloc.bar_index, bgcolor=color.new(cSupply, tr0), border_color=zBorder ? cSupply : color.new(cSupply, 100), border_width=zBorder ? zBordW : 0, extend=extend.right)
+        f_addSup(bx, g, high >= sBot and low <= sTop)
+        if array.size(supBoxes) > maxZonesEff
+            f_delSup(f_weakSup())
+    priorPH := high[swingLenEff]
+
+// DEMAND zone at a confirmed swing low — GRADED
+if showZones and barstate.isconfirmed and not na(pl)
+    a    = atr[swingLenEff]
+    dBot = low[swingLenEff]
+    dTop = useWickBody ? math.max(open[swingLenEff], close[swingLenEff]) : high[swingLenEff]
+    if dTop - dBot > maxWidth * a
+        dTop := dBot + maxWidth * a
+    legUp = hiLeg - dBot                                             // upward impulse off the pivot
+    disp  = useDisp  and legUp >= dispMult * a
+    swept = useSweep and not na(priorPL) and low[swingLenEff] < priorPL - 0.1 * a and close[swingLenEff] > priorPL
+    zw    = dTop - dBot
+    tight = useWidth and zw <= goodWidth * a and zw >= 0.05 * a
+    g = (disp ? 1 : 0) + (swept ? 1 : 0) + (tight ? 1 : 0)
+    if g >= minDrawGrEff
+        tr0 = math.max(0, math.min(95, zTransp - g * 7))
+        bx = box.new(bar_index - swingLenEff, dTop, bar_index, dBot, xloc=xloc.bar_index, bgcolor=color.new(cDemand, tr0), border_color=zBorder ? cDemand : color.new(cDemand, 100), border_width=zBorder ? zBordW : 0, extend=extend.right)
+        f_addDem(bx, g, high >= dBot and low <= dTop)
+        if array.size(demBoxes) > maxZonesEff
+            f_delDem(f_weakDem())
+    priorPL := low[swingLenEff]
+
+// Per-bar maintenance: count taps (freshness) and invalidate on full close-through.
+if showZones and barstate.isconfirmed
+    if array.size(supBoxes) > 0
+        for i = array.size(supBoxes) - 1 to 0
+            bx = array.get(supBoxes, i)
+            if removeMit and close > box.get_top(bx)
+                f_delSup(i)
+            else
+                ins = high >= box.get_bottom(bx) and low <= box.get_top(bx)
+                if ins and not array.get(supInside, i)
+                    array.set(supTouch, i, array.get(supTouch, i) + 1)
+                array.set(supInside, i, ins)
+    if array.size(demBoxes) > 0
+        for i = array.size(demBoxes) - 1 to 0
+            bx = array.get(demBoxes, i)
+            if removeMit and close < box.get_bottom(bx)
+                f_delDem(i)
+            else
+                ins = high >= box.get_bottom(bx) and low <= box.get_top(bx)
+                if ins and not array.get(demInside, i)
+                    array.set(demTouch, i, array.get(demTouch, i) + 1)
+                array.set(demInside, i, ins)
+
+// =============================================================================
+// FAIR VALUE GAPS (3-candle imbalance) — quality-filtered, non-repainting
+// =============================================================================
+var array<box> bullFvgs = array.new<box>()
+var array<box> bearFvgs = array.new<box>()
+
+if showFVG and barstate.isconfirmed
+    af = atr
+    // Bullish FVG: gap between the high 2 bars back and the current low
+    if low > high[2] and low - high[2] >= fvgMinMultEff * af
+        fb = box.new(bar_index - 1, low, bar_index, high[2], xloc=xloc.bar_index, bgcolor=cFvgBull, border_color=fvgBorder ? fvgBordCol : color.new(cFvgBull, 100), border_width=fvgBorder ? 1 : 0, extend=extend.right)
+        array.push(bullFvgs, fb)
+        if array.size(bullFvgs) > maxFvg
+            box.delete(array.shift(bullFvgs))
+    // Bearish FVG: gap between the low 2 bars back and the current high
+    if high < low[2] and low[2] - high >= fvgMinMultEff * af
+        fb = box.new(bar_index - 1, low[2], bar_index, high, xloc=xloc.bar_index, bgcolor=cFvgBear, border_color=fvgBorder ? fvgBordCol : color.new(cFvgBear, 100), border_width=fvgBorder ? 1 : 0, extend=extend.right)
+        array.push(bearFvgs, fb)
+        if array.size(bearFvgs) > maxFvg
+            box.delete(array.shift(bearFvgs))
+    // Mitigation: remove a gap once price trades to its far edge (fills it)
+    if fvgFill
+        if array.size(bullFvgs) > 0
+            for i = array.size(bullFvgs) - 1 to 0
+                fb = array.get(bullFvgs, i)
+                if low <= box.get_bottom(fb)
+                    box.delete(fb)
+                    array.remove(bullFvgs, i)
+        if array.size(bearFvgs) > 0
+            for i = array.size(bearFvgs) - 1 to 0
+                fb = array.get(bearFvgs, i)
+                if high >= box.get_top(fb)
+                    box.delete(fb)
+                    array.remove(bearFvgs, i)
+
+// =============================================================================
+// SIGNAL ENGINE  (pullback -> reclaim trigger + confirmation stack)
+// =============================================================================
+// Recent pullback range (includes the current bar). Used by both the trigger
+// and the location filter so "where price tested" is measured over the dip,
+// not just the single reclaim bar.
+pbLo = ta.lowest(low,  pbLook)
+pbHi = ta.highest(high, pbLook)
+
+// Base trigger: a recent tag of the fast EMA, then a reclaim cross with a
+// candle in the signal's direction. crossover/under = ONE shot at the reclaim.
+buyTrig  = biasUp and close > open and ta.crossover(close, emaFast)  and pbLo <= emaFast
+sellTrig = biasDn and close < open and ta.crossunder(close, emaFast) and pbHi >= emaFast
+
+// Momentum turn
+momLongOK  = rsi > 50 and rsi >= rsi[1]
+momShortOK = rsi < 50 and rsi <= rsi[1]
+
+// Location confluence: the pullback tested a zone, or came near the prior-day level
+nearPDL = not na(pdL) and math.abs(pbLo - pdL) <= locTol * atr
+nearPDH = not na(pdH) and math.abs(pbHi - pdH) <= locTol * atr
+locLong  = f_demandTouched(pbLo, pbHi, sigMinGr) or nearPDL
+locShort = f_supplyTouched(pbLo, pbHi, sigMinGr) or nearPDH
+
+// Confirmation tally + threshold. A signal needs AT LEAST 'reqConf' of the
+// ENABLED confirmations to pass on the trigger bar — not necessarily all of them.
+nReq   = (useHTF ? 1 : 0) + (useMom ? 1 : 0) + (useVol ? 1 : 0) + (useLoc ? 1 : 0)
+nLong  = (useHTF and htfBias == 1 ? 1 : 0) + (useMom and momLongOK ? 1 : 0) + (useVol and volOK ? 1 : 0) + (useLoc and locLong ? 1 : 0)
+nShort = (useHTF and htfBias == -1 ? 1 : 0) + (useMom and momShortOK ? 1 : 0) + (useVol and volOK ? 1 : 0) + (useLoc and locShort ? 1 : 0)
+effReq = math.min(reqConf, nReq)        // can't require more confirmations than are enabled
+barOK  = not confirmClose or barstate.isconfirmed
+
+// Hard higher-timeframe gate (optional): block trades that fight the bigger
+// trend entirely, no matter how the other confirmations stack up.
+htfPassL = not useHTF or not htfHard or htfBias == 1
+htfPassS = not useHTF or not htfHard or htfBias == -1
+
+buySig  = buyTrig  and barOK and htfPassL and nLong  >= effReq
+sellSig = sellTrig and barOK and htfPassS and nShort >= effReq
+
+// Cooldown spacing
+var int lastSigBar = na
+cooled = cooldown == 0 or na(lastSigBar) or (bar_index - lastSigBar) >= cooldown
+buy  = buySig  and cooled
+sell = sellSig and cooled
+if buy or sell
+    lastSigBar := bar_index
+
+plotshape(buy,  "Buy",  shape.triangleup,   location.belowbar, color.new(cBull, 0), text="BUY",  textcolor=color.white, size=size.tiny)
+plotshape(sell, "Sell", shape.triangledown, location.abovebar, color.new(cBear, 0), text="SELL", textcolor=color.white, size=size.tiny)
+
+// Dashboard read-outs: how many confirmations pass now, and whether the
+// 'reqConf' threshold is met (drives the "ready" verdict + cell colour).
+confShown = curBias == 1 ? nLong : curBias == -1 ? nShort : 0
+confFull  = nReq > 0 and confShown >= effReq
+
+// =============================================================================
+// DRAW PRIOR-DAY + PREVIOUS-SESSION LEVELS
+// =============================================================================
+var line  lnPdHi   = line.new(na, na, na, na, xloc=xloc.bar_index)
+var line  lnPdLo   = line.new(na, na, na, na, xloc=xloc.bar_index)
+var line  lnSessHi = line.new(na, na, na, na, xloc=xloc.bar_index)
+var line  lnSessLo = line.new(na, na, na, na, xloc=xloc.bar_index)
+var label lbPdHi   = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left)
+var label lbPdLo   = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left)
+var label lbSessHi = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left)
+var label lbSessLo = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left)
+
+if barstate.islast
+    // ---- Prior-day high / low ----
+    bool drawPd = showPD and not na(pdH) and not na(pdL)
+    if drawPd
+        line.set_xy1(lnPdHi, bar_index - 1, pdH)
+        line.set_xy2(lnPdHi, bar_index, pdH)
+        line.set_extend(lnPdHi, extend.right)
+        line.set_color(lnPdHi, cPdHi)
+        line.set_width(lnPdHi, wPd)
+        line.set_style(lnPdHi, f_lineStyle(styPdS))
+        line.set_xy1(lnPdLo, bar_index - 1, pdL)
+        line.set_xy2(lnPdLo, bar_index, pdL)
+        line.set_extend(lnPdLo, extend.right)
+        line.set_color(lnPdLo, cPdLo)
+        line.set_width(lnPdLo, wPd)
+        line.set_style(lnPdLo, f_lineStyle(styPdS))
+        if lblPd
+            label.set_xy(lbPdHi, bar_index + lblOffset, pdH)
+            label.set_text(lbPdHi, "PD High  " + str.tostring(pdH, format.mintick))
+            label.set_textcolor(lbPdHi, lblTxtCol)
+            label.set_color(lbPdHi, cPdHi)
+            label.set_style(lbPdHi, label.style_label_left)
+            label.set_size(lbPdHi, f_lblSize(lblSizeS))
+            label.set_text_font_family(lbPdHi, f_font(lblFont))
+            label.set_xy(lbPdLo, bar_index + lblOffset, pdL)
+            label.set_text(lbPdLo, "PD Low  " + str.tostring(pdL, format.mintick))
+            label.set_textcolor(lbPdLo, lblTxtCol)
+            label.set_color(lbPdLo, cPdLo)
+            label.set_style(lbPdLo, label.style_label_left)
+            label.set_size(lbPdLo, f_lblSize(lblSizeS))
+            label.set_text_font_family(lbPdLo, f_font(lblFont))
+        else
+            label.set_xy(lbPdHi, bar_index, na)
+            label.set_xy(lbPdLo, bar_index, na)
+    else
+        line.set_xy1(lnPdHi, bar_index, na)
+        line.set_xy2(lnPdHi, bar_index, na)
+        line.set_xy1(lnPdLo, bar_index, na)
+        line.set_xy2(lnPdLo, bar_index, na)
+        label.set_xy(lbPdHi, bar_index, na)
+        label.set_xy(lbPdLo, bar_index, na)
+    // ---- Previous session high / low ----
+    bool drawSess = showSess and not na(pSessHi) and not na(pSessLo)
+    if drawSess
+        line.set_xy1(lnSessHi, bar_index - 1, pSessHi)
+        line.set_xy2(lnSessHi, bar_index, pSessHi)
+        line.set_extend(lnSessHi, extend.right)
+        line.set_color(lnSessHi, cSessHi)
+        line.set_width(lnSessHi, wSess)
+        line.set_style(lnSessHi, f_lineStyle(stySessS))
+        line.set_xy1(lnSessLo, bar_index - 1, pSessLo)
+        line.set_xy2(lnSessLo, bar_index, pSessLo)
+        line.set_extend(lnSessLo, extend.right)
+        line.set_color(lnSessLo, cSessLo)
+        line.set_width(lnSessLo, wSess)
+        line.set_style(lnSessLo, f_lineStyle(stySessS))
+        if lblPd
+            label.set_xy(lbSessHi, bar_index + lblOffset, pSessHi)
+            label.set_text(lbSessHi, "Prev Sess High  " + str.tostring(pSessHi, format.mintick))
+            label.set_textcolor(lbSessHi, lblTxtCol)
+            label.set_color(lbSessHi, cSessHi)
+            label.set_style(lbSessHi, label.style_label_left)
+            label.set_size(lbSessHi, f_lblSize(lblSizeS))
+            label.set_text_font_family(lbSessHi, f_font(lblFont))
+            label.set_xy(lbSessLo, bar_index + lblOffset, pSessLo)
+            label.set_text(lbSessLo, "Prev Sess Low  " + str.tostring(pSessLo, format.mintick))
+            label.set_textcolor(lbSessLo, lblTxtCol)
+            label.set_color(lbSessLo, cSessLo)
+            label.set_style(lbSessLo, label.style_label_left)
+            label.set_size(lbSessLo, f_lblSize(lblSizeS))
+            label.set_text_font_family(lbSessLo, f_font(lblFont))
+        else
+            label.set_xy(lbSessHi, bar_index, na)
+            label.set_xy(lbSessLo, bar_index, na)
+    else
+        line.set_xy1(lnSessHi, bar_index, na)
+        line.set_xy2(lnSessHi, bar_index, na)
+        line.set_xy1(lnSessLo, bar_index, na)
+        line.set_xy2(lnSessLo, bar_index, na)
+        label.set_xy(lbSessHi, bar_index, na)
+        label.set_xy(lbSessLo, bar_index, na)
+
+// Re-grade styling each bar: stronger grade = more opaque + thicker border;
+// tapped zones are dimmed. Also reflects live settings changes.
+if showZones and barstate.islast
+    if array.size(supBoxes) > 0
+        for i = 0 to array.size(supBoxes) - 1
+            g  = array.get(supGrade, i)
+            tr = math.max(0, math.min(95, zTransp - g * 7 + (dimTapped and array.get(supTouch, i) > 0 ? 14 : 0)))
+            bx = array.get(supBoxes, i)
+            box.set_bgcolor(bx, color.new(cSupply, tr))
+            box.set_border_color(bx, zBorder ? cSupply : color.new(cSupply, 100))
+            box.set_border_width(bx, zBorder ? zBordW + (g >= 3 ? 1 : 0) : 0)
+    if array.size(demBoxes) > 0
+        for i = 0 to array.size(demBoxes) - 1
+            g  = array.get(demGrade, i)
+            tr = math.max(0, math.min(95, zTransp - g * 7 + (dimTapped and array.get(demTouch, i) > 0 ? 14 : 0)))
+            bx = array.get(demBoxes, i)
+            box.set_bgcolor(bx, color.new(cDemand, tr))
+            box.set_border_color(bx, zBorder ? cDemand : color.new(cDemand, 100))
+            box.set_border_width(bx, zBorder ? zBordW + (g >= 3 ? 1 : 0) : 0)
+
+// =============================================================================
+// DASHBOARD  (customizable — colors, rows, title, size; drawn last)
+// =============================================================================
+dTxtSize = f_lblSize(dashTxtSz)
+allLong  = curBias == 1  and confFull
+allShort = curBias == -1 and confFull
+verdict = buy ? "LONG ▲" : sell ? "SHORT ▼" : allLong ? "LONG ready" : allShort ? "SHORT ready" : "WAIT"
+vcol    = (buy or allLong) ? cBull : (sell or allShort) ? cBear : cNeut
+biasTxt(int b) => b == 1 ? "Up ▲" : b == -1 ? "Down ▼" : "Flat"
+biasCol(int b) => b == 1 ? cBull : b == -1 ? cBear : cNeut
+
+p = pos == "Top Right" ? position.top_right : pos == "Top Left" ? position.top_left : pos == "Bottom Right" ? position.bottom_right : position.bottom_left
+var table t = table.new(p, 2, 14, bgcolor=dashBg, frame_color=dashFrameCol, frame_width=dashFrame ? 1 : 0, border_color=dashFrameCol, border_width=dashFrame ? 1 : 0)
+
+// One styled row: label (left) + value (right). Mutating the table inside a
+// function is legal in Pine; only REASSIGNING a global would not be.
+f_row(int r, string k, string v, color vbg, color vtx) =>
+    table.cell(t, 0, r, k, text_color=dashTxt, bgcolor=dashBg, text_size=dTxtSize, text_halign=text.align_left)
+    table.cell(t, 1, r, v, text_color=vtx, bgcolor=vbg, text_size=dTxtSize, text_halign=text.align_right)
+
+if showDash and barstate.islast
+    int rc = 0
+    // Header (always shown when the dashboard is on)
+    table.cell(t, 0, rc, dashTitle, text_color=dashHdrTx, bgcolor=dashHdrBg, text_size=dTxtSize, text_halign=text.align_left)
+    table.cell(t, 1, rc, syminfo.ticker + "  ·  " + timeframe.period, text_color=dashHdrTx, bgcolor=dashHdrBg, text_size=dTxtSize, text_halign=text.align_right)
+    rc += 1
+    if rowVerdict
+        f_row(rc, "VERDICT", verdict, vcol, color.white)
+        rc += 1
+    if rowThisTF
+        f_row(rc, "This TF (" + timeframe.period + ")", biasTxt(curBias), dashBg, biasCol(curBias))
+        rc += 1
+    if rowHTF
+        f_row(rc, "Bigger TF (" + htf + ")", biasTxt(htfBias), dashBg, biasCol(htfBias))
+        rc += 1
+    if rowConf
+        f_row(rc, "Confirms (need " + str.tostring(effReq) + ")", str.tostring(confShown) + " / " + str.tostring(nReq), confFull ? vcol : dashBg, confFull ? color.white : dashTxt)
+        rc += 1
+    if rowRSI
+        f_row(rc, "Momentum (RSI)", str.tostring(math.round(rsi)), dashBg, rsi > 50 ? cBull : rsi < 50 ? cBear : dashTxt)
+        rc += 1
+    if rowVol
+        f_row(rc, "Volume", volOK ? "Strong" : "Weak", dashBg, volOK ? cBull : cNeut)
+        rc += 1
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(buy,  "Buy Signal",  "SMC Combined: BUY signal (confirmation threshold met)")
+alertcondition(sell, "Sell Signal", "SMC Combined: SELL signal (confirmation threshold met)")
