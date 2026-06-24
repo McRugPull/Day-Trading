@@ -1,0 +1,500 @@
+//@version=6
+// =============================================================================
+//  S&D Zone-Entry Alert Engine — multi-timeframe swing supply/demand alerts
+// -----------------------------------------------------------------------------
+//  PURPOSE
+//    A PURE, fully-customizable ALERT ENGINE. By default it draws NOTHING and
+//    exists only to fire a TradingView alert when the CHART's live price wicks
+//    into (or closes inside) a supply/demand zone that is measured on a HIGHER
+//    timeframe — regardless of what timeframe your chart is on. You can trade on
+//    1m / 5m and still be pinged the instant price taps a 30m or 1h zone.
+//
+//  HOW ZONES ARE DEFINED
+//    Zones come from CONFIRMED swing pivots (ta.pivothigh / ta.pivotlow) on the
+//    watched higher timeframe, exactly like classic SMC supply/demand. A pivot
+//    confirms `len` bars AFTER it forms, so a zone only surfaces once it is fully
+//    confirmed — it never repaints. HTF reads use request.security with
+//    lookahead=barmerge.lookahead_off, so the HTF zone only updates on its own
+//    bar close and the alert never paints into the past.
+//
+//  MULTIPLE TIMEFRAME SLOTS
+//    Three independent slots (e.g. 15m AND 30m AND 1h) — each separately
+//    toggleable, with its own timeframe, pivot length, zone height and label.
+//    Slot 1 is ON by default; slots 2 & 3 are OFF. (The HTF request for every
+//    slot always runs internally — that is correct and cheap; only CONSUMPTION
+//    is gated by each slot's enable.)
+//
+//  ANTI-SPAM
+//    Re-arm-on-exit latch is the hard-wired core: one ping per fresh tap, not one
+//    per bar while price sits inside. Optional strict re-arm (closed bar fully
+//    outside), optional cooldown bars (a tap blocked by cooldown is DEFERRED and
+//    fires on the first eligible bar, never silently dropped), and optional
+//    max-alerts-per-session.
+//
+//  TRIGGER MODE
+//    Intrabar (wick) fires the instant the forming chart bar's range touches the
+//    HTF zone (catches 1m wicks). On bar close fires only if the chart bar CLOSES
+//    inside the zone (slower, no false wicks).
+//
+//  DEBUG VISUALIZATION
+//    Default OFF -> the engine is a pure alert tool that draws nothing. Turn it on
+//    to faintly render each enabled slot's currently-watched HTF band so you can
+//    verify exactly what the engine is tracking.
+//
+//  TO RECEIVE ALERTS
+//    Right-click the chart -> Add alert -> set Condition to this indicator and
+//    choose "Any alert() function call", then Create. Each slot+side has its own
+//    alert() call site, so they never suppress one another on the same bar.
+// =============================================================================
+indicator("S&D Zone-Entry Alert Engine", overlay=true, max_boxes_count=20, max_labels_count=20)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// ---- Engine ----------------------------------------------------------------
+gEng = "Engine"
+engOn     = input.bool  (true, "Engine ON (master kill-switch)", group=gEng, tooltip="Master kill-switch. When off, no slot fires and nothing draws, regardless of per-slot enables.")
+trigMode  = input.string("Intrabar (wick)", "Trigger mode", options=["Intrabar (wick)","On bar close"], group=gEng, tooltip="Intrabar fires the instant the chart bar's range touches the HTF zone (catches 1m wicks; may retrace). On bar close fires only if the chart bar CLOSES inside the zone (slower, no false wicks).")
+priceSrc  = input.string("Bar range (high/low)", "Intrabar price source", options=["Bar range (high/low)","Close only"], group=gEng, tooltip="What chart-price defines 'inside the zone' in Intrabar mode. Bar range = wick test. Close only = ignore wick-only pokes. On-bar-close mode always uses close.")
+
+// ---- Zone Definition (defaults) --------------------------------------------
+gZone = "Zone Definition (defaults)"
+zLenDefault    = input.int   (10, "Default pivot legs", minval=2, maxval=50, group=gZone, tooltip="Default pivot legs — bars on each side of a swing high/low — used by any slot set to Inherit. Higher = fewer, bigger, more significant zones. A zone confirms this many bars AFTER the pivot, so it never repaints.")
+zHeightDefault = input.string("Wick to body", "Default zone height", options=["Wick to body","Full candle"], group=gZone, tooltip="Default zone height. Wick to body = tighter institutional band (rejection wick + body). Full candle = whole high-low of the swing candle.")
+zTouchPadTicks = input.float (0.0, "Touch tolerance (ticks)", minval=0, step=0.5, group=gZone, tooltip="Tolerance in ticks added to each zone edge before the entry test. A small value (1-2) lets a near-miss wick count, reducing 'missed tap' complaints. Multiplied by syminfo.mintick. 0 = exact edge.")
+
+// ---- TF Slot 1 -------------------------------------------------------------
+gS1 = "TF Slot 1"
+s1On         = input.bool     (true, "Enable slot 1", group=gS1, tooltip="Enable this slot. When off, its HTF zone is ignored and it never alerts. (The HTF request still runs internally — that is correct and cheap.)")
+s1TF         = input.timeframe("15", "Slot 1 timeframe", group=gS1, tooltip="Higher timeframe whose supply/demand zones this slot watches (e.g. 30 = 30-minute). Independent of your chart timeframe; should be >= your chart TF.")
+s1LenMode    = input.string   ("Inherit", "Slot 1 length mode", options=["Inherit","Custom"], group=gS1, tooltip="Inherit = use the default pivot legs from Zone Definition. Custom = use this slot's own value below.")
+s1Len        = input.int      (10, "Slot 1 custom pivot legs", minval=2, maxval=50, group=gS1, tooltip="Pivot legs for this slot when Length mode = Custom.")
+s1HeightMode = input.string   ("Inherit", "Slot 1 zone height", options=["Inherit","Wick to body","Full candle"], group=gS1, tooltip="Zone height for this slot. Inherit = use the Zone Definition default.")
+s1WatchSupply= input.bool     (true, "Slot 1 watch supply", group=gS1, tooltip="Alert on this slot's supply (resistance) zones.")
+s1WatchDemand= input.bool     (true, "Slot 1 watch demand", group=gS1, tooltip="Alert on this slot's demand (support) zones.")
+s1Label      = input.string   ("15m", "Slot 1 label", group=gS1, tooltip="Human label for this slot injected into the alert message, so you know which TF pinged.")
+
+// ---- TF Slot 2 -------------------------------------------------------------
+gS2 = "TF Slot 2"
+s2On         = input.bool     (false, "Enable slot 2", group=gS2, tooltip="Enable this slot. When off, its HTF zone is ignored and it never alerts. (The HTF request still runs internally — that is correct and cheap.)")
+s2TF         = input.timeframe("30", "Slot 2 timeframe", group=gS2, tooltip="Higher timeframe whose supply/demand zones this slot watches (e.g. 30 = 30-minute). Independent of your chart timeframe; should be >= your chart TF.")
+s2LenMode    = input.string   ("Inherit", "Slot 2 length mode", options=["Inherit","Custom"], group=gS2, tooltip="Inherit = use the default pivot legs from Zone Definition. Custom = use this slot's own value below.")
+s2Len        = input.int      (10, "Slot 2 custom pivot legs", minval=2, maxval=50, group=gS2, tooltip="Pivot legs for this slot when Length mode = Custom.")
+s2HeightMode = input.string   ("Inherit", "Slot 2 zone height", options=["Inherit","Wick to body","Full candle"], group=gS2, tooltip="Zone height for this slot. Inherit = use the Zone Definition default.")
+s2WatchSupply= input.bool     (true, "Slot 2 watch supply", group=gS2, tooltip="Alert on this slot's supply (resistance) zones.")
+s2WatchDemand= input.bool     (true, "Slot 2 watch demand", group=gS2, tooltip="Alert on this slot's demand (support) zones.")
+s2Label      = input.string   ("30m", "Slot 2 label", group=gS2, tooltip="Human label for this slot injected into the alert message, so you know which TF pinged.")
+
+// ---- TF Slot 3 -------------------------------------------------------------
+gS3 = "TF Slot 3"
+s3On         = input.bool     (false, "Enable slot 3", group=gS3, tooltip="Enable this slot. When off, its HTF zone is ignored and it never alerts. (The HTF request still runs internally — that is correct and cheap.)")
+s3TF         = input.timeframe("60", "Slot 3 timeframe", group=gS3, tooltip="Higher timeframe whose supply/demand zones this slot watches (e.g. 60 = 1-hour). Independent of your chart timeframe; should be >= your chart TF.")
+s3LenMode    = input.string   ("Inherit", "Slot 3 length mode", options=["Inherit","Custom"], group=gS3, tooltip="Inherit = use the default pivot legs from Zone Definition. Custom = use this slot's own value below.")
+s3Len        = input.int      (15, "Slot 3 custom pivot legs", minval=2, maxval=50, group=gS3, tooltip="Pivot legs for this slot when Length mode = Custom.")
+s3HeightMode = input.string   ("Inherit", "Slot 3 zone height", options=["Inherit","Wick to body","Full candle"], group=gS3, tooltip="Zone height for this slot. Inherit = use the Zone Definition default.")
+s3WatchSupply= input.bool     (true, "Slot 3 watch supply", group=gS3, tooltip="Alert on this slot's supply (resistance) zones.")
+s3WatchDemand= input.bool     (true, "Slot 3 watch demand", group=gS3, tooltip="Alert on this slot's demand (support) zones.")
+s3Label      = input.string   ("1H", "Slot 3 label", group=gS3, tooltip="Human label for this slot injected into the alert message, so you know which TF pinged.")
+
+// ---- Anti-Spam -------------------------------------------------------------
+gSpam = "Anti-Spam"
+spamRearmOnExit  = input.bool(true,  "Re-arm only after price leaves zone", group=gSpam, tooltip="Require price to LEAVE the zone before this slot+side can fire again. The core anti-spam latch — gives you one ping per fresh tap, not one per bar while price sits inside. If off, only cooldown limits re-fires.")
+spamExitClose    = input.bool(false, "Strict re-arm (closed bar fully outside)", group=gSpam, tooltip="Stricter re-arm: require a CLOSED bar fully outside the zone to re-arm (not just a wick out). Stops a single bar straddling the edge from re-arming and re-firing. Evaluated on confirmed bars only.")
+spamCooldownBars = input.int (0, "Cooldown (chart bars between alerts)", minval=0, maxval=5000, group=gSpam, tooltip="Minimum CHART bars between two alerts from the same slot+side. A tap that lands inside the cooldown window is DEFERRED and fires on the first eligible bar — never silently dropped. 0 = disabled. On a 1m chart this is minutes.")
+spamMaxPerSession= input.int (0, "Max alerts per session (per slot+side)", minval=0, maxval=1000, group=gSpam, tooltip="Hard cap on alerts per slot+side per UTC day. Resets on a new daily session. 0 = unlimited. Prevents a chop day emitting dozens of pings.")
+
+// ---- Alert Message ---------------------------------------------------------
+gMsg = "Alert Message"
+msgPrefix     = input.string("⚠️", "Prefix text", group=gMsg, tooltip="Free text prepended to every alert (emoji, account tag, webhook routing keyword). In JSON mode it is emitted as a \"prefix\" key.")
+msgShowTicker = input.bool  (true,  "Include ticker", group=gMsg, tooltip="Include the ticker symbol (syminfo.ticker).")
+msgShowTF     = input.bool  (true,  "Include TF label", group=gMsg, tooltip="Include the slot's TF label.")
+msgShowDir    = input.bool  (true,  "Include direction (SUPPLY/DEMAND)", group=gMsg, tooltip="Include the direction word SUPPLY / DEMAND (with its emoji).")
+msgShowBand   = input.bool  (true,  "Include zone price band", group=gMsg, tooltip="Include the zone price band (low - high), formatted to mintick.")
+msgShowPrice  = input.bool  (false, "Include live price", group=gMsg, tooltip="Include the live price (close) that triggered the alert.")
+msgSupEmoji   = input.string("🔴", "Supply emoji", group=gMsg, tooltip="Emoji shown for supply hits when direction is included.")
+msgDemEmoji   = input.string("🟢", "Demand emoji", group=gMsg, tooltip="Emoji shown for demand hits when direction is included.")
+msgTail       = input.string("", "Tail text", group=gMsg, tooltip="Free text appended to every alert (e.g. a webhook keyword / strategy tag). In JSON mode it is emitted as a \"tail\" key.")
+msgJson       = input.bool  (false, "JSON payload (webhook)", group=gMsg, tooltip="Emit a compact JSON payload instead of human text (keys: prefix, sym, tf, side, bot, top, price, tail). Field toggles above still select which keys appear; prefix/tail keys appear when their text is non-empty. Webhook-friendly.")
+alertFreqMode = input.string("Auto (match trigger)", "Alert frequency", options=["Auto (match trigger)","Once per bar","Once per bar close"], group=gMsg, tooltip="Auto: intrabar -> once per bar, on-close -> once per bar close. Note: in Intrabar trigger mode the 'Once per bar close' override is ignored (it would nullify wick alerts) and once-per-bar is forced instead.")
+
+// ---- Debug Visualization ---------------------------------------------------
+gDbg = "Debug Visualization (off = pure alert engine)"
+dbgOn          = input.bool  (false, "Debug draw watched zones", group=gDbg, tooltip="MASTER DEBUG TOGGLE — off by default. When off, the engine draws absolutely nothing. When on, faintly renders each enabled slot's currently-watched HTF supply/demand band so you can verify what's tracked. Verification only.")
+dbgSupCol      = input.color (color.new(#ef5350, 80), "Supply band color", group=gDbg, tooltip="Supply band fill (debug).")
+dbgDemCol      = input.color (color.new(#26a69a, 80), "Demand band color", group=gDbg, tooltip="Demand band fill (debug).")
+dbgShowLabel   = input.bool  (true,  "Debug band labels", group=gDbg, tooltip="Draw a small label naming the slot/TF/side on each debug band.")
+dbgLblSize     = input.string("Small", "Debug label size", options=["Tiny","Small","Normal","Large"], group=gDbg, tooltip="Text size for the debug band labels.")
+dbgShowArmState= input.bool  (false, "Tint disarmed bands", group=gDbg, tooltip="Tint a band differently while its slot+side is disarmed (fired, waiting to re-arm) so you can watch the latch.")
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+f_lblSize(string s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
+
+// Latest confirmed swing supply & demand zone bounds on whatever timeframe this
+// runs in. valuewhen() holds the most recent pivot's levels forward, so when this
+// is called via request.security it returns the live HTF zone the alert watches.
+// All ta.* calls are UNCONDITIONAL (the intended HTF-context pattern); len /
+// wickBody only affect arithmetic, never whether a ta.* call runs.
+f_htfZone(int len, bool wickBody) =>
+    ph = ta.pivothigh(len, len)
+    pl = ta.pivotlow (len, len)
+    supTop = ta.valuewhen(not na(ph), high[len], 0)
+    supBot = ta.valuewhen(not na(ph), wickBody ? math.min(open[len], close[len]) : low[len],  0)
+    demBot = ta.valuewhen(not na(pl), low[len], 0)
+    demTop = ta.valuewhen(not na(pl), wickBody ? math.max(open[len], close[len]) : high[len], 0)
+    [supTop, supBot, demTop, demBot]
+
+// Pure message builder — string concatenation only, NEVER calls alert().
+// dir = "SUPPLY"/"DEMAND"; lo/hi = TRUE (unpadded) zone bounds.
+f_msg(string slotLabel, string dir, string emoji, float lo, float hi) =>
+    string out = ""
+    if msgJson
+        // Compact JSON; only toggled keys included; numbers unquoted.
+        out := "{"
+        bool first = true
+        if msgPrefix != ""
+            out := out + "\"prefix\":\"" + msgPrefix + "\""
+            first := false
+        if msgShowTicker
+            out := out + (first ? "" : ",") + "\"sym\":\"" + syminfo.ticker + "\""
+            first := false
+        if msgShowTF
+            out := out + (first ? "" : ",") + "\"tf\":\"" + slotLabel + "\""
+            first := false
+        if msgShowDir
+            out := out + (first ? "" : ",") + "\"side\":\"" + (dir == "SUPPLY" ? "supply" : "demand") + "\""
+            first := false
+        if msgShowBand
+            out := out + (first ? "" : ",") + "\"bot\":" + str.tostring(lo, format.mintick) + ",\"top\":" + str.tostring(hi, format.mintick)
+            first := false
+        if msgShowPrice
+            out := out + (first ? "" : ",") + "\"price\":" + str.tostring(close, format.mintick)
+            first := false
+        if msgTail != ""
+            out := out + (first ? "" : ",") + "\"tail\":\"" + msgTail + "\""
+            first := false
+        out := out + "}"
+    else
+        out := msgPrefix
+        if msgShowTicker
+            out := out + (out == "" ? "" : " ") + syminfo.ticker
+        if msgShowTF
+            out := out + (out == "" ? "" : " ") + "[" + slotLabel + "]"
+        if msgShowDir
+            out := out + (out == "" ? "" : " ") + emoji + " " + dir + " tap"
+        if msgShowBand
+            out := out + (out == "" ? "" : " ") + "(" + str.tostring(lo, format.mintick) + " – " + str.tostring(hi, format.mintick) + ")"
+        if msgShowPrice
+            out := out + (out == "" ? "" : " ") + "@ " + str.tostring(close, format.mintick)
+        if msgTail != ""
+            out := out + (out == "" ? "" : " ") + msgTail
+    out
+
+// =============================================================================
+// EFFECTIVE PER-SLOT PARAMS  (global scope, BEFORE the security calls)
+// -----------------------------------------------------------------------------
+// Resolved into simple-per-bar values so they are legal as f_htfZone() args.
+// =============================================================================
+s1LenEff  = s1LenMode == "Custom" ? s1Len : zLenDefault
+s2LenEff  = s2LenMode == "Custom" ? s2Len : zLenDefault
+s3LenEff  = s3LenMode == "Custom" ? s3Len : zLenDefault
+
+s1WickEff = s1HeightMode == "Wick to body" ? true : s1HeightMode == "Full candle" ? false : (zHeightDefault == "Wick to body")
+s2WickEff = s2HeightMode == "Wick to body" ? true : s2HeightMode == "Full candle" ? false : (zHeightDefault == "Wick to body")
+s3WickEff = s3HeightMode == "Wick to body" ? true : s3HeightMode == "Full candle" ? false : (zHeightDefault == "Wick to body")
+
+// =============================================================================
+// HTF ZONE READS  —  3 slots, fully UNROLLED, unconditional, downstream-gated
+// -----------------------------------------------------------------------------
+//  These are the ONLY request.security calls. They are at global scope, never in
+//  an if/for/ternary, never gated by sNOn (gating request.security is the #1 v6
+//  compile failure). All 3 always execute; CONSUMPTION is gated downstream.
+//  lookahead=barmerge.lookahead_off + the len-bar pivot offset inside f_htfZone =
+//  the proven non-repaint idiom (no [1]/lookahead_on hacks here).
+// =============================================================================
+[s1SupTop, s1SupBot, s1DemTop, s1DemBot] = request.security(syminfo.tickerid, s1TF, f_htfZone(s1LenEff, s1WickEff), lookahead=barmerge.lookahead_off)
+[s2SupTop, s2SupBot, s2DemTop, s2DemBot] = request.security(syminfo.tickerid, s2TF, f_htfZone(s2LenEff, s2WickEff), lookahead=barmerge.lookahead_off)
+[s3SupTop, s3SupBot, s3DemTop, s3DemBot] = request.security(syminfo.tickerid, s3TF, f_htfZone(s3LenEff, s3WickEff), lookahead=barmerge.lookahead_off)
+
+// ---- Padded bands (widen each edge by the tolerance) ------------------------
+// Padded bands are used for the entry/exit TESTS only. The TRUE (unpadded) bounds
+// are what gets reported in the message and drawn in debug.
+pad = zTouchPadTicks * syminfo.mintick
+s1SupTopP = s1SupTop + pad
+s1SupBotP = s1SupBot - pad
+s1DemTopP = s1DemTop + pad
+s1DemBotP = s1DemBot - pad
+s2SupTopP = s2SupTop + pad
+s2SupBotP = s2SupBot - pad
+s2DemTopP = s2DemTop + pad
+s2DemBotP = s2DemBot - pad
+s3SupTopP = s3SupTop + pad
+s3SupBotP = s3SupBot - pad
+s3DemTopP = s3DemTop + pad
+s3DemBotP = s3DemBot - pad
+
+// =============================================================================
+// MODE RESOLUTION + FREQUENCY  (computed once, global scope)
+// =============================================================================
+intrabar  = trigMode == "Intrabar (wick)"
+useClose  = not intrabar                              // on-close path
+wickRange = intrabar and priceSrc == "Bar range (high/low)"
+
+// Frequency. The 'Once per bar close' override is coerced to once-per-bar while
+// in Intrabar trigger mode — otherwise a retraced wick would call alert() intrabar
+// but TradingView would only deliver at close (where enter=false), silently
+// dropping every wick the user opted into.
+almFreq = alertFreqMode == "Once per bar"       ? alert.freq_once_per_bar :
+          alertFreqMode == "Once per bar close" ? (intrabar ? alert.freq_once_per_bar : alert.freq_once_per_bar_close) :
+          useClose ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+
+// New UTC day boundary — used to reset per-session counters. Computed once at
+// global scope (NOT inside request.security).
+newSession = timeframe.change("D")
+
+// =============================================================================
+// PER-CHANNEL STATE  (6 channels = 3 slots x 2 sides; all `var`, persistent)
+// =============================================================================
+var bool s1SupArmed = true
+var int  s1SupLastBar = na
+var int  s1SupSessCnt = 0
+var bool s1SupPend = false
+var bool s1DemArmed = true
+var int  s1DemLastBar = na
+var int  s1DemSessCnt = 0
+var bool s1DemPend = false
+var bool s2SupArmed = true
+var int  s2SupLastBar = na
+var int  s2SupSessCnt = 0
+var bool s2SupPend = false
+var bool s2DemArmed = true
+var int  s2DemLastBar = na
+var int  s2DemSessCnt = 0
+var bool s2DemPend = false
+var bool s3SupArmed = true
+var int  s3SupLastBar = na
+var int  s3SupSessCnt = 0
+var bool s3SupPend = false
+var bool s3DemArmed = true
+var int  s3DemLastBar = na
+var int  s3DemSessCnt = 0
+var bool s3DemPend = false
+
+// Session reset — clear every channel's counter on a new daily session.
+if newSession
+    s1SupSessCnt := 0
+    s1DemSessCnt := 0
+    s2SupSessCnt := 0
+    s2DemSessCnt := 0
+    s3SupSessCnt := 0
+    s3DemSessCnt := 0
+
+// =============================================================================
+// ENTRY DETECTION + ANTI-SPAM  (per channel, all global scope)
+// -----------------------------------------------------------------------------
+//  inRaw   : GEOMETRIC test only — price within the PADDED band (mode-aware,
+//            na-guarded). NO enable/watch gating here, so flipping a slot ON while
+//            price already sits inside does NOT manufacture a false rising edge.
+//  outside : price fully clear of the PADDED band (for the re-arm latch).
+//  enter   : first bar of a fresh tap (inRaw and not inRaw[1]).
+//  pend    : enter (armed, cap, on-close gated) latches a pending tap; the pending
+//            tap fires on the first bar that also clears the cooldown — a tap inside
+//            the cooldown window is DEFERRED, never dropped.
+//  fire    : pending AND cooldown OK AND enable/watch gates open.
+//  With defaults (rearm on, strict off, cooldown 0, cap 0) this reduces exactly
+//  to "inRaw and not inRaw[1], re-arm on exit" — the proven original logic.
+// =============================================================================
+
+// ---------- enable/watch gates (applied at fire stage, NOT inside the edge) ----------
+s1SupGate = engOn and s1On and s1WatchSupply
+s2SupGate = engOn and s2On and s2WatchSupply
+s3SupGate = engOn and s3On and s3WatchSupply
+s1DemGate = engOn and s1On and s1WatchDemand
+s2DemGate = engOn and s2On and s2WatchDemand
+s3DemGate = engOn and s3On and s3WatchDemand
+
+// ---------- geometric inside tests (price-vs-zone only) ----------
+// Supply inside: wick-range -> bar range overlaps band; else close within band.
+s1SupInRaw = not na(s1SupTop) and (wickRange ? (high >= s1SupBotP and low <= s1SupTopP) : (close >= s1SupBotP and close <= s1SupTopP))
+s2SupInRaw = not na(s2SupTop) and (wickRange ? (high >= s2SupBotP and low <= s2SupTopP) : (close >= s2SupBotP and close <= s2SupTopP))
+s3SupInRaw = not na(s3SupTop) and (wickRange ? (high >= s3SupBotP and low <= s3SupTopP) : (close >= s3SupBotP and close <= s3SupTopP))
+// Demand inside.
+s1DemInRaw = not na(s1DemTop) and (wickRange ? (low <= s1DemTopP and high >= s1DemBotP) : (close >= s1DemBotP and close <= s1DemTopP))
+s2DemInRaw = not na(s2DemTop) and (wickRange ? (low <= s2DemTopP and high >= s2DemBotP) : (close >= s2DemBotP and close <= s2DemTopP))
+s3DemInRaw = not na(s3DemTop) and (wickRange ? (low <= s3DemTopP and high >= s3DemBotP) : (close >= s3DemBotP and close <= s3DemTopP))
+
+// ---------- outside (re-arm) tests ----------
+// Strict re-arm (spamExitClose): a CLOSED bar whose close is fully clear of the
+// band. Otherwise: the bar range is entirely clear of the band. na -> not outside.
+s1SupOutside = not na(s1SupTop) and (spamExitClose ? (barstate.isconfirmed and (close < s1SupBotP or close > s1SupTopP)) : (low > s1SupTopP or high < s1SupBotP))
+s2SupOutside = not na(s2SupTop) and (spamExitClose ? (barstate.isconfirmed and (close < s2SupBotP or close > s2SupTopP)) : (low > s2SupTopP or high < s2SupBotP))
+s3SupOutside = not na(s3SupTop) and (spamExitClose ? (barstate.isconfirmed and (close < s3SupBotP or close > s3SupTopP)) : (low > s3SupTopP or high < s3SupBotP))
+s1DemOutside = not na(s1DemTop) and (spamExitClose ? (barstate.isconfirmed and (close < s1DemBotP or close > s1DemTopP)) : (low > s1DemTopP or high < s1DemBotP))
+s2DemOutside = not na(s2DemTop) and (spamExitClose ? (barstate.isconfirmed and (close < s2DemBotP or close > s2DemTopP)) : (low > s2DemTopP or high < s2DemBotP))
+s3DemOutside = not na(s3DemTop) and (spamExitClose ? (barstate.isconfirmed and (close < s3DemBotP or close > s3DemTopP)) : (low > s3DemTopP or high < s3DemBotP))
+
+// ---------- re-arm latch ----------
+// If rearm-on-exit is off, the channel is always considered armed (only
+// cooldown/cap throttle it).
+if spamRearmOnExit and not s1SupArmed and s1SupOutside
+    s1SupArmed := true
+if spamRearmOnExit and not s2SupArmed and s2SupOutside
+    s2SupArmed := true
+if spamRearmOnExit and not s3SupArmed and s3SupOutside
+    s3SupArmed := true
+if spamRearmOnExit and not s1DemArmed and s1DemOutside
+    s1DemArmed := true
+if spamRearmOnExit and not s2DemArmed and s2DemOutside
+    s2DemArmed := true
+if spamRearmOnExit and not s3DemArmed and s3DemOutside
+    s3DemArmed := true
+
+s1SupArmEff = spamRearmOnExit ? s1SupArmed : true
+s2SupArmEff = spamRearmOnExit ? s2SupArmed : true
+s3SupArmEff = spamRearmOnExit ? s3SupArmed : true
+s1DemArmEff = spamRearmOnExit ? s1DemArmed : true
+s2DemArmEff = spamRearmOnExit ? s2DemArmed : true
+s3DemArmEff = spamRearmOnExit ? s3DemArmed : true
+
+// ---------- first-entry edge (geometric) ----------
+s1SupEnter = s1SupInRaw and not s1SupInRaw[1]
+s2SupEnter = s2SupInRaw and not s2SupInRaw[1]
+s3SupEnter = s3SupInRaw and not s3SupInRaw[1]
+s1DemEnter = s1DemInRaw and not s1DemInRaw[1]
+s2DemEnter = s2DemInRaw and not s2DemInRaw[1]
+s3DemEnter = s3DemInRaw and not s3DemInRaw[1]
+
+// ---------- cooldown / cap helpers ----------
+f_cooldownOK(int lastBar) => spamCooldownBars == 0 or na(lastBar) or (bar_index - lastBar) >= spamCooldownBars
+f_capOK(int cnt)          => spamMaxPerSession == 0 or cnt < spamMaxPerSession
+
+// ---------- latch pending taps (defer-on-cooldown) ----------
+// A qualifying enter (gate open, armed, cap OK, on-close gated) sets pending=true.
+// pending stays true until the alert actually fires (cleared in the emit block) —
+// so a tap blocked only by cooldown fires on the first bar cooldown clears.
+// useClose -> require confirmed bar for the entry to count.
+if s1SupGate and s1SupEnter and s1SupArmEff and f_capOK(s1SupSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s1SupPend := true
+if s2SupGate and s2SupEnter and s2SupArmEff and f_capOK(s2SupSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s2SupPend := true
+if s3SupGate and s3SupEnter and s3SupArmEff and f_capOK(s3SupSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s3SupPend := true
+if s1DemGate and s1DemEnter and s1DemArmEff and f_capOK(s1DemSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s1DemPend := true
+if s2DemGate and s2DemEnter and s2DemArmEff and f_capOK(s2DemSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s2DemPend := true
+if s3DemGate and s3DemEnter and s3DemArmEff and f_capOK(s3DemSessCnt) and (useClose ? barstate.isconfirmed : true)
+    s3DemPend := true
+
+// ---------- fire eligibility ----------
+// Re-check the enable gate at fire time so disabling a slot drops a still-pending
+// tap rather than firing it after the user turned the slot off.
+s1SupFire = s1SupPend and s1SupGate and f_cooldownOK(s1SupLastBar)
+s2SupFire = s2SupPend and s2SupGate and f_cooldownOK(s2SupLastBar)
+s3SupFire = s3SupPend and s3SupGate and f_cooldownOK(s3SupLastBar)
+s1DemFire = s1DemPend and s1DemGate and f_cooldownOK(s1DemLastBar)
+s2DemFire = s2DemPend and s2DemGate and f_cooldownOK(s2DemLastBar)
+s3DemFire = s3DemPend and s3DemGate and f_cooldownOK(s3DemLastBar)
+
+// =============================================================================
+// ALERT EMIT  —  the ONLY place alert() appears (global scope, inside top-level if)
+// -----------------------------------------------------------------------------
+//  Each channel has its own call site, so per-call-site frequency is per channel:
+//  slot1-supply and slot2-demand can both ping the same bar without suppressing
+//  each other. Messages report the TRUE (unpadded) bounds. The pending flag is
+//  cleared here so a deferred tap fires exactly once.
+// =============================================================================
+if s1SupFire
+    alert(f_msg(s1Label, "SUPPLY", msgSupEmoji, s1SupBot, s1SupTop), almFreq)
+    s1SupArmed   := false
+    s1SupLastBar := bar_index
+    s1SupSessCnt += 1
+    s1SupPend    := false
+if s1DemFire
+    alert(f_msg(s1Label, "DEMAND", msgDemEmoji, s1DemBot, s1DemTop), almFreq)
+    s1DemArmed   := false
+    s1DemLastBar := bar_index
+    s1DemSessCnt += 1
+    s1DemPend    := false
+if s2SupFire
+    alert(f_msg(s2Label, "SUPPLY", msgSupEmoji, s2SupBot, s2SupTop), almFreq)
+    s2SupArmed   := false
+    s2SupLastBar := bar_index
+    s2SupSessCnt += 1
+    s2SupPend    := false
+if s2DemFire
+    alert(f_msg(s2Label, "DEMAND", msgDemEmoji, s2DemBot, s2DemTop), almFreq)
+    s2DemArmed   := false
+    s2DemLastBar := bar_index
+    s2DemSessCnt += 1
+    s2DemPend    := false
+if s3SupFire
+    alert(f_msg(s3Label, "SUPPLY", msgSupEmoji, s3SupBot, s3SupTop), almFreq)
+    s3SupArmed   := false
+    s3SupLastBar := bar_index
+    s3SupSessCnt += 1
+    s3SupPend    := false
+if s3DemFire
+    alert(f_msg(s3Label, "DEMAND", msgDemEmoji, s3DemBot, s3DemTop), almFreq)
+    s3DemArmed   := false
+    s3DemLastBar := bar_index
+    s3DemSessCnt += 1
+    s3DemPend    := false
+
+// =============================================================================
+// DEBUG VISUALIZATION  (default OFF — engine draws NOTHING unless dbgOn)
+// -----------------------------------------------------------------------------
+//  One persistent box + one persistent label per slot+side (6 + 6), created once
+//  with na coords. Updated only on barstate.islast. Hidden by moving to na coords.
+//  Never box.new / label.new per bar. Reads the SAME series the alerts use, so
+//  what you see is exactly what is watched. Fixed-width stub (not extend.right)
+//  so it reads as a debug marker.
+// =============================================================================
+var box   bS1Sup = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS1Sup = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+var box   bS1Dem = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS1Dem = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+var box   bS2Sup = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS2Sup = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+var box   bS2Dem = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS2Dem = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+var box   bS3Sup = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS3Sup = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+var box   bS3Dem = box.new(na, na, na, na, xloc=xloc.bar_index)
+var label lS3Dem = label.new(na, na, "", xloc=xloc.bar_index, style=label.style_label_left, size=size.small)
+
+// Draw/refresh one debug band. Mutates the supplied box+label handles; hides them
+// (na coords) when not visible. `disarmed` dims the fill so you can watch the latch.
+f_dbgBand(box bx, label lb, bool vis, bool isSup, float top, float bot, string slotLabel, bool disarmed) =>
+    if vis
+        int L = bar_index - 5
+        int R = bar_index + 10
+        color baseCol = isSup ? dbgSupCol : dbgDemCol
+        color fillCol = (dbgShowArmState and disarmed) ? color.new(baseCol, math.min(100, color.t(baseCol) + 10)) : baseCol
+        box.set_lefttop(bx, L, top)
+        box.set_rightbottom(bx, R, bot)
+        box.set_bgcolor(bx, fillCol)
+        box.set_border_color(bx, color.new(baseCol, 100))
+        if dbgShowLabel
+            label.set_xy(lb, R, (top + bot) / 2)
+            label.set_text(lb, slotLabel + (isSup ? " SUP" : " DEM") + " (" + str.tostring(bot, format.mintick) + " – " + str.tostring(top, format.mintick) + ")")
+            label.set_textcolor(lb, color.new(baseCol, 0))
+            label.set_color(lb, color.new(baseCol, 100))
+            label.set_size(lb, f_lblSize(dbgLblSize))
+        else
+            label.set_xy(lb, bar_index, na)
+    else
+        box.set_lefttop(bx, bar_index, na)
+        box.set_rightbottom(bx, bar_index, na)
+        label.set_xy(lb, bar_index, na)
+
+if barstate.islast
+    bool dbgBase = dbgOn and engOn
+    f_dbgBand(bS1Sup, lS1Sup, dbgBase and s1On and s1WatchSupply and not na(s1SupTop), true,  s1SupTop, s1SupBot, s1Label, not s1SupArmed)
+    f_dbgBand(bS1Dem, lS1Dem, dbgBase and s1On and s1WatchDemand and not na(s1DemTop), false, s1DemTop, s1DemBot, s1Label, not s1DemArmed)
+    f_dbgBand(bS2Sup, lS2Sup, dbgBase and s2On and s2WatchSupply and not na(s2SupTop), true,  s2SupTop, s2SupBot, s2Label, not s2SupArmed)
+    f_dbgBand(bS2Dem, lS2Dem, dbgBase and s2On and s2WatchDemand and not na(s2DemTop), false, s2DemTop, s2DemBot, s2Label, not s2DemArmed)
+    f_dbgBand(bS3Sup, lS3Sup, dbgBase and s3On and s3WatchSupply and not na(s3SupTop), true,  s3SupTop, s3SupBot, s3Label, not s3SupArmed)
+    f_dbgBand(bS3Dem, lS3Dem, dbgBase and s3On and s3WatchDemand and not na(s3DemTop), false, s3DemTop, s3DemBot, s3Label, not s3DemArmed)
